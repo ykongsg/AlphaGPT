@@ -24,7 +24,7 @@ class AlphaEngine:
         self.best_formula = None
 
     def train(self):
-        print("🚀 Starting Meme Alpha Mining...")
+        print("[!] Starting Meme Alpha Mining.")
         pbar = tqdm(range(ModelConfig.TRAIN_STEPS))
         
         for step in pbar:
@@ -35,7 +35,7 @@ class AlphaEngine:
             tokens_list = []
             
             for _ in range(ModelConfig.MAX_FORMULA_LEN):
-                logits, _ = self.model(inp)
+                logits, _, _ = self.model(inp)  # Updated to handle task_probs from MTPHead
                 dist = Categorical(logits=logits)
                 action = dist.sample()
                 

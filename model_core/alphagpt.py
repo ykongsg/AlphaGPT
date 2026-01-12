@@ -1,7 +1,132 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .config import ModelConfig
 from .ops import OPS_CONFIG
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization"""
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+    
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        return (x / rms) * self.weight
+
+
+class QKNorm(nn.Module):
+    """Query-Key Normalization for Attention"""
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.scale = nn.Parameter(torch.ones(1, 1, 1, d_model) * (d_model ** -0.5))
+    
+    def forward(self, q, k):
+        # Normalize Q and K independently
+        q_norm = F.normalize(q, p=2, dim=-1)
+        k_norm = F.normalize(k, p=2, dim=-1)
+        return q_norm * self.scale, k_norm * self.scale
+
+
+class SwiGLU(nn.Module):
+    """Swish GLU activation function"""
+    def __init__(self, d_in, d_ff):
+        super().__init__()
+        self.w = nn.Linear(d_in, d_ff * 2)
+        self.fc = nn.Linear(d_ff, d_in)
+    
+    def forward(self, x):
+        x_glu = self.w(x)
+        x, gate = x_glu.chunk(2, dim=-1)
+        x = x * F.silu(gate)  # Swish activation
+        return self.fc(x)
+
+
+class MTPHead(nn.Module):
+    """Multi-Task Pooling Head for multi-objective learning"""
+    def __init__(self, d_model, vocab_size, num_tasks=3):
+        super().__init__()
+        self.num_tasks = num_tasks
+        self.task_heads = nn.ModuleList([
+            nn.Linear(d_model, vocab_size) for _ in range(num_tasks)
+        ])
+        self.task_weights = nn.Parameter(torch.ones(num_tasks) / num_tasks)
+        self.task_router = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, num_tasks)
+        )
+    
+    def forward(self, x):
+        # Route to appropriate task heads
+        task_logits = self.task_router(x)
+        task_probs = F.softmax(task_logits, dim=-1)
+        
+        # Compute all task outputs
+        task_outputs = [head(x) for head in self.task_heads]
+        task_outputs = torch.stack(task_outputs, dim=1)  # [B, num_tasks, vocab_size]
+        
+        # Weighted combination
+        weighted = (task_probs.unsqueeze(-1) * task_outputs).sum(dim=1)
+        return weighted, task_probs
+
+
+class LoopedTransformerLayer(nn.Module):
+    """Looped Transformer Layer - recurrent processing within a layer"""
+    def __init__(self, d_model, nhead, dim_feedforward, num_loops=3, dropout=0.1):
+        super().__init__()
+        self.num_loops = num_loops
+        self.d_model = d_model
+        self.nhead = nhead
+        
+        # QK-Norm attention
+        self.qk_norm = QKNorm(d_model // nhead)
+        
+        # Standard attention components
+        self.attention = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+        
+        # RMSNorm instead of LayerNorm
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+        
+        # SwiGLU FFN instead of standard FFN
+        self.ffn = SwiGLU(d_model, dim_feedforward)
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, mask=None, is_causal=False):
+        # Looped processing - recurrent refinement
+        for _ in range(self.num_loops):
+            # Self-attention with residual
+            x_norm = self.norm1(x)
+            attn_out, _ = self.attention(x_norm, x_norm, x_norm, attn_mask=mask, is_causal=is_causal)
+            x = x + self.dropout(attn_out)
+            
+            # FFN with residual
+            x_norm = self.norm2(x)
+            ffn_out = self.ffn(x_norm)
+            x = x + self.dropout(ffn_out)
+        
+        return x
+
+
+class LoopedTransformer(nn.Module):
+    """Looped Transformer Encoder with multiple loop iterations"""
+    def __init__(self, d_model, nhead, num_layers, dim_feedforward, num_loops=3, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            LoopedTransformerLayer(d_model, nhead, dim_feedforward, num_loops, dropout)
+            for _ in range(num_layers)
+        ])
+    
+    def forward(self, x, mask=None, is_causal=False):
+        for layer in self.layers:
+            x = layer(x, mask=mask, is_causal=is_causal)
+        return x
+
 
 class AlphaGPT(nn.Module):
     def __init__(self):
@@ -17,13 +142,21 @@ class AlphaGPT(nn.Module):
         self.token_emb = nn.Embedding(self.vocab_size, self.d_model)
         self.pos_emb = nn.Parameter(torch.zeros(1, ModelConfig.MAX_FORMULA_LEN + 1, self.d_model))
         
-        # Transformer Decoder
-        layer = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=4, dim_feedforward=128, batch_first=True)
-        self.blocks = nn.TransformerEncoder(layer, num_layers=2)
+        # Enhanced Transformer with Looped Transformer
+        self.blocks = LoopedTransformer(
+            d_model=self.d_model,
+            nhead=4,
+            num_layers=2,
+            dim_feedforward=128,
+            num_loops=3,
+            dropout=0.1
+        )
         
-        # Output Heads
-        self.ln_f = nn.LayerNorm(self.d_model)
-        self.head_actor = nn.Linear(self.d_model, self.vocab_size)
+        # RMSNorm instead of LayerNorm
+        self.ln_f = RMSNorm(self.d_model)
+        
+        # MTPHead for multi-task output
+        self.mtp_head = MTPHead(self.d_model, self.vocab_size, num_tasks=3)
         self.head_critic = nn.Linear(self.d_model, 1)
 
     def forward(self, idx):
@@ -35,11 +168,14 @@ class AlphaGPT(nn.Module):
         # Causal Mask
         mask = nn.Transformer.generate_square_subsequent_mask(T).to(idx.device)
         
+        # Process through looped transformer
         x = self.blocks(x, mask=mask, is_causal=True)
         x = self.ln_f(x)
         
         last_emb = x[:, -1, :]
-        logits = self.head_actor(last_emb)
+        
+        # Multi-task pooling head for logits
+        logits, task_probs = self.mtp_head(last_emb)
         value = self.head_critic(last_emb)
         
-        return logits, value
+        return logits, value, task_probs
